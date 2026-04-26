@@ -35,7 +35,7 @@ class BiRefNet:
         with torch.no_grad():
             preds = self.model(input_images)[-1].sigmoid().cpu()
         pred = preds[0].squeeze()
-        pred_pil = transforms.ToPILImage()(pred)
+        pred_pil = transforms.ToPILImage()(pred.to(torch.float32))
         mask = pred_pil.resize(image_size)
         image.putalpha(mask)
         return image

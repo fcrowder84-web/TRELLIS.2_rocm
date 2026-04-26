@@ -83,7 +83,13 @@ class DinoV3FeatureExtractor:
         hidden_states = self.model.embeddings(image, bool_masked_pos=None)
         position_embeddings = self.model.rope_embeddings(image)
 
-        for i, layer_module in enumerate(self.model.layer):
+        layers = None
+        for name, module in self.model.named_modules():
+            if isinstance(module, torch.nn.ModuleList) and len(module) >= 12:
+                layers = module
+                break
+                
+        for i, layer_module in enumerate(layers):
             hidden_states = layer_module(
                 hidden_states,
                 position_embeddings=position_embeddings,
