@@ -1,4 +1,5 @@
 from typing import *
+import os
 from tqdm import tqdm
 import numpy as np
 import torch
@@ -225,36 +226,33 @@ def to_glb(
         pbar.set_description("Sampling attributes")
     if verbose:
         print("Sampling attributes...", end='', flush=True)
-        
-    # Setup differentiable rasterizer context
-    ctx = dr.RasterizeCudaContext()
-    # Prepare UV coordinates for rasterization (rendering in UV space)
-    uvs_rast = torch.cat([out_uvs * 2 - 1, torch.zeros_like(out_uvs[:, :1]), torch.ones_like(out_uvs[:, :1])], dim=-1).unsqueeze(0)
-    rast = torch.zeros((1, texture_size, texture_size, 4), device='cuda', dtype=torch.float32)
-    
-    # Rasterize in chunks to save memory
-    for i in range(0, out_faces.shape[0], 100000):
-        rast_chunk, _ = dr.rasterize(
-            ctx, uvs_rast, out_faces[i:i+100000],
-            resolution=[texture_size, texture_size],
-        )
-        mask_chunk = rast_chunk[..., 3:4] > 0
-        rast_chunk[..., 3:4] += i # Store face ID in alpha channel
-        rast = torch.where(mask_chunk, rast_chunk, rast)
-    
-    # Mask of valid pixels in texture
-    mask = rast[0, ..., 3] > 0
-    
-    # Interpolate 3D positions in UV space (finding 3D coord for every texel)
-    pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
+
+    # GPU UV-space rasterizer via custom HIP kernel. The nvdiffrast ROCm port
+    # has a wave32 shuffle bug that produces ~48% coverage, so this custom
+    # kernel handles UV-space texture baking instead.
+    import sys
+    _trellis_root = os.path.join(os.path.dirname(__file__), '..', '..', '..')
+    if _trellis_root not in sys.path:
+        sys.path.insert(0, _trellis_root)
+    from trellis2.utils.uv_rasterize import uv_rasterize
+
+    face_ids_torch, pos = uv_rasterize(
+        out_uvs, out_faces, out_vertices, texture_size, verbose=verbose
+    )
+
+    mask = face_ids_torch > 0
+    if verbose:
+        coverage = mask.sum().item() / (texture_size * texture_size) * 100
+        print(f"[uv_rasterize] Coverage: {mask.sum().item()}/{texture_size*texture_size} ({coverage:.1f}%)")
+
     valid_pos = pos[mask]
-    
+
     # Map these positions back to the *original* high-res mesh to get accurate attributes
     # This corrects geometric errors introduced by simplification/remeshing
     _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
     orig_tri_verts = vertices[faces[face_id.long()]] # (N_new, 3, 3)
     valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
-    
+
     # Trilinear sampling from the attribute volume (Color, Material props)
     attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device='cuda')
     attrs[mask] = grid_sample_3d(
@@ -284,7 +282,7 @@ def to_glb(
     alpha = np.clip(attrs[..., attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     alpha_mode = 'OPAQUE'
     
-    # Inpainting: fill gaps (dilation) to prevent black seams at UV boundaries
+    # Inpainting: fill gaps to prevent black seams at UV boundaries
     mask_inv = (~mask).astype(np.uint8)
     base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
     metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]

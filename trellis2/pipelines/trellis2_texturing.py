@@ -316,82 +316,47 @@ class Trellis2TexturingPipeline(Pipeline):
         uvs = uvs_torch.cpu().numpy()
         normals = normals[vmap.cpu().numpy()]
                 
-        # --- NVDIFRAST BYPASS: Pure PyTorch / OpenCV Rasterizer ---
-        print("[ROCm] Bypassing NVDiffrast: Rasterizing UVs via OpenCV & PyTorch...")
-        H, W = texture_size, texture_size
-        face_ids = np.zeros((H, W), dtype=np.int32)
-        uvs_px = uvs * np.array([W - 1, H - 1])
-        uvs_px_int = np.round(uvs_px).astype(np.int32)
-        
-        # 1. Draw the stencil mask
-        for i, f in enumerate(faces):
-            cv2.fillConvexPoly(face_ids, uvs_px_int[f], i + 1, lineType=cv2.LINE_8)
-            
-        face_ids_torch = torch.from_numpy(face_ids).long().cuda()
+        # GPU UV-space rasterizer via custom HIP kernel. The nvdiffrast ROCm
+        # port has a wave32 shuffle bug that produces ~48% coverage, so this
+        # custom kernel handles UV-space texture baking instead.
+        from trellis2.utils.uv_rasterize import uv_rasterize
+
+        face_ids_torch, pos = uv_rasterize(
+            uvs_torch, faces_torch, vertices_torch, texture_size, verbose=True
+        )
+
         mask = face_ids_torch > 0
-        
+        coverage = mask.sum().item() / (texture_size * texture_size) * 100
+        print(f"[uv_rasterize] Coverage: {mask.sum().item()}/{texture_size*texture_size} ({coverage:.1f}%)")
+
         attrs = torch.zeros(texture_size, texture_size, pbr_voxel.shape[1], device=self.device)
-        
-        if mask.any(): 
-            # 2. Get pixel coordinates
-            gy, gx = torch.meshgrid(torch.arange(H, device='cuda'), torch.arange(W, device='cuda'), indexing='ij')
-            px = gx[mask].float()
-            py = gy[mask].float()
-            
-            # 3. Fetch vertex data for each valid pixel
-            valid_face_idx = face_ids_torch[mask] - 1
-            valid_faces = faces_torch[valid_face_idx].long()
-            
-            uv0 = uvs_torch[valid_faces[:, 0]] * torch.tensor([W - 1, H - 1], device='cuda')
-            uv1 = uvs_torch[valid_faces[:, 1]] * torch.tensor([W - 1, H - 1], device='cuda')
-            uv2 = uvs_torch[valid_faces[:, 2]] * torch.tensor([W - 1, H - 1], device='cuda')
-            
-            p0 = vertices_torch[valid_faces[:, 0]]
-            p1 = vertices_torch[valid_faces[:, 1]]
-            p2 = vertices_torch[valid_faces[:, 2]]
-            
-            # 4. Barycentric Math (Cramer's Rule)
-            denom = (uv1[:, 1] - uv2[:, 1]) * (uv0[:, 0] - uv2[:, 0]) + (uv2[:, 0] - uv1[:, 0]) * (uv0[:, 1] - uv2[:, 1])
-            denom = torch.where(denom == 0, torch.ones_like(denom) * 1e-6, denom)
-            
-            w0 = ((uv1[:, 1] - uv2[:, 1]) * (px - uv2[:, 0]) + (uv2[:, 0] - uv1[:, 0]) * (py - uv2[:, 1])) / denom
-            w1 = ((uv2[:, 1] - uv0[:, 1]) * (px - uv2[:, 0]) + (uv0[:, 0] - uv2[:, 0]) * (py - uv2[:, 1])) / denom
-            w2 = 1.0 - w0 - w1
-            
-            # 5. Interpolate precise 3D position
-            interp_pos = w0.unsqueeze(1) * p0 + w1.unsqueeze(1) * p1 + w2.unsqueeze(1) * p2
-            
-            # 6. Sample AI Voxel Colors (Forced FP32 to avoid ROCm sampler bugs)
+
+        if mask.any():
+            valid_pos = pos[mask]
+            # Sample AI Voxel Colors (Forced FP32 to avoid ROCm sampler bugs)
             sampled = flex_gemm.ops.grid_sample.grid_sample_3d(
                 pbr_voxel.feats.float(),
                 pbr_voxel.coords.to(torch.int32),
                 shape=torch.Size([*pbr_voxel.shape, *pbr_voxel.spatial_shape]),
-                grid=((interp_pos + 0.5) * resolution).reshape(1, -1, 3).float(),
+                grid=((valid_pos + 0.5) * resolution).reshape(1, -1, 3).float(),
                 mode='trilinear',
             )
             attrs[mask] = sampled.to(attrs.dtype)
-            print(f"[ROCm] Rasterized pixels: {mask.sum().item()} / {H*W}")
-        # ---------------------------------------------------------
+            print(f"[uv_rasterize] Rasterized pixels: {mask.sum().item()} / {texture_size*texture_size}")
         
         mask_np = mask.cpu().numpy()
         
-        # --- GAMMA CORRECTION FIX ---
-        # AI outputs Linear color. We apply a 1/2.2 gamma curve to convert to sRGB 
-        # so the texture doesn't render unnaturally dark in standard 3D viewers.
-        base_linear = np.clip(attrs[..., self.pbr_attr_layout['base_color']].cpu().numpy(), 0.0, 1.0)
-        base_srgb = np.power(base_linear, 1.0 / 2.2) 
-        base_color = (base_srgb * 255).astype(np.uint8)
-        # ----------------------------
-        
+        base_color = np.clip(attrs[..., self.pbr_attr_layout['base_color']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
         metallic = np.clip(attrs[..., self.pbr_attr_layout['metallic']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
         roughness = np.clip(attrs[..., self.pbr_attr_layout['roughness']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
         alpha = np.clip(attrs[..., self.pbr_attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
         
-        inpaint_mask = (~mask_np).astype(np.uint8)
-        base_color = cv2.inpaint(base_color, inpaint_mask, 3, cv2.INPAINT_TELEA)
-        metallic = cv2.inpaint(metallic, inpaint_mask, 1, cv2.INPAINT_TELEA)[..., None]
-        roughness = cv2.inpaint(roughness, inpaint_mask, 1, cv2.INPAINT_TELEA)[..., None]
-        alpha = cv2.inpaint(alpha, inpaint_mask, 1, cv2.INPAINT_TELEA)[..., None]
+        # Inpainting: fill gaps to prevent black seams at UV boundaries
+        mask_inv = (~mask_np).astype(np.uint8)
+        base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
+        metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+        roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+        alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
         
         material = trimesh.visual.material.PBRMaterial(
             baseColorTexture=Image.fromarray(np.concatenate([base_color, alpha], axis=-1)),
@@ -399,10 +364,7 @@ class Trellis2TexturingPipeline(Pipeline):
             metallicRoughnessTexture=Image.fromarray(np.concatenate([np.zeros_like(metallic), roughness, metallic], axis=-1)),
             metallicFactor=1.0,
             roughnessFactor=1.0,
-            # --- ALPHA CULLING FIX ---
-            alphaMode='MASK',     # Tells the renderer to respect transparency
-            alphaCutoff=0.5,      # Tears the cape where alpha is below 50%
-            # -------------------------
+            alphaMode='OPAQUE',
             doubleSided=True,
         )
 

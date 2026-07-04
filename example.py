@@ -2,6 +2,7 @@ import os
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 os.environ["PYTORCH_HIP_ALLOC_CONF"] = "garbage_collection_threshold:0.6,max_split_size_mb:128"
 os.environ["HSA_XNACK"] = "1"
+os.environ["TORCH_DONT_CHECK_COMPILER_ABI"] = "1"
 
 import cv2
 import imageio
@@ -23,7 +24,7 @@ pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
 pipeline.cuda()
 
 # 3. Load Image & Run
-image = Image.open("assets/cube.png")
+image = Image.open("assets/example_image/T.png")
 mesh = pipeline.run(image)[0]
 mesh.simplify(16777216) # nvdiffrast limit
 
