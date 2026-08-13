@@ -1,0 +1,60 @@
+diff --git a/setup.py b/setup.py
+index 8849b10..07e5482 100644
+--- a/setup.py
++++ b/setup.py
+@@ -115,10 +115,9 @@ ext_modules = [
+         ],
+         extra_compile_args={
+             "cxx": cxx_flags,
+-            "nvcc": nvcc_flags + [
++            'nvcc': nvcc_flags + ([] if IS_HIP else ['--extended-lambda']) + [
+                 # The following definitions must be undefined
+                 # since we need half-precision operation.
+-                "--extended-lambda",
+                 "-U__CUDA_NO_HALF_OPERATORS__",
+                 "-U__CUDA_NO_HALF_CONVERSIONS__",
+                 "-U__CUDA_NO_HALF2_OPERATORS__",
+diff --git a/src/clean_up.cu b/src/clean_up.cu
+index a72b1d0..7b1d9d6 100644
+--- a/src/clean_up.cu
++++ b/src/clean_up.cu
+@@ -239,10 +239,17 @@ static __global__ void select_first_in_each_group_kernel(
+
+ struct int3_decomposer
+ {
++#if defined(__HIP_PLATFORM_AMD__)
++    __host__ __device__ rocprim::tuple<int&, int&, int&> operator()(int3& key) const
++    {
++        return rocprim::tuple<int&, int&, int&>(key.x, key.y, key.z);
++    }
++#else
+     __host__ __device__ ::cuda::std::tuple<int&, int&, int&> operator()(int3& key) const
+     {
+         return {key.x, key.y, key.z};
+     }
++#endif
+ };
+
+
+diff --git a/src/dtypes.cuh b/src/dtypes.cuh
+index bff560c..f951c39 100644
+--- a/src/dtypes.cuh
++++ b/src/dtypes.cuh
+@@ -13,7 +13,7 @@ namespace cumesh {
+ struct __align__(16) Vec3f {
+     float x, y, z;
+
+-    __device__ __forceinline__ Vec3f();
++    __host__ __device__ __forceinline__ Vec3f();
+     __device__ __forceinline__ Vec3f(float x, float y, float z);
+     __device__ __forceinline__ Vec3f(float3 v);
+     __device__ __forceinline__ Vec3f operator+(const Vec3f& o) const;
+@@ -55,7 +55,7 @@ struct __align__(16) QEM
+ };
+
+
+-__device__ __forceinline__ Vec3f::Vec3f() {
++__host__ __device__ __forceinline__ Vec3f::Vec3f() {
+     x = 0.0f;
+     y = 0.0f;
+     z = 0.0f;

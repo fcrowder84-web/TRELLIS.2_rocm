@@ -11,6 +11,24 @@ __all__ = [
 ]
 
 
+def _grouped_sdpa(q, k, v, q_seq_lens, kv_seq_lens):
+    """Apply inference-only SDPA independently to each sparse window."""
+    from torch.nn.functional import scaled_dot_product_attention
+
+    outputs = []
+    q_start = kv_start = 0
+    for q_len, kv_len in zip(q_seq_lens.tolist(), kv_seq_lens.tolist()):
+        q_group = q[q_start:q_start + q_len].transpose(0, 1).unsqueeze(0)
+        k_group = k[kv_start:kv_start + kv_len].transpose(0, 1).unsqueeze(0)
+        v_group = v[kv_start:kv_start + kv_len].transpose(0, 1).unsqueeze(0)
+        out = scaled_dot_product_attention(
+            q_group, k_group, v_group, dropout_p=0.0, is_causal=False
+        )
+        outputs.append(out.squeeze(0).transpose(0, 1))
+        q_start += q_len
+        kv_start += kv_len
+    return torch.cat(outputs, dim=0)
+
 def calc_window_partition(
     tensor: SparseTensor,
     window_size: Union[int, Tuple[int, ...]],
@@ -55,6 +73,8 @@ def calc_window_partition(
         attn_func_args = {
             'attn_bias': xops.fmha.BlockDiagonalMask.from_seqlens(seq_lens)
         }
+    elif config.ATTN == 'sdpa':
+        attn_func_args = {}
     elif config.ATTN == 'flash_attn':
         attn_func_args = {
             'cu_seqlens': torch.cat([torch.tensor([0], device=tensor.device), torch.cumsum(seq_lens, dim=0)], dim=0).int(),
@@ -109,6 +129,9 @@ def sparse_windowed_scaled_dot_product_self_attention(
         k = k.unsqueeze(0)                                                              # [1, M, H, C]
         v = v.unsqueeze(0)                                                              # [1, M, H, C]
         out = xops.memory_efficient_attention(q, k, v, **attn_func_args)[0]             # [M, H, C]
+    elif config.ATTN == 'sdpa':
+        q, k, v = qkv_feats.unbind(dim=1)
+        out = _grouped_sdpa(q, k, v, seq_lens, seq_lens)
     elif config.ATTN == 'flash_attn':
         if 'flash_attn' not in globals():
             import flash_attn
@@ -177,6 +200,9 @@ def sparse_windowed_scaled_dot_product_cross_attention(
         v = v.unsqueeze(0)                                                              # [1, M, H, C]
         mask = xops.fmha.BlockDiagonalMask.from_seqlens(q_seq_lens, kv_seq_lens)
         out = xops.memory_efficient_attention(q, k, v, attn_bias=mask)[0]               # [M, H, C]
+    elif config.ATTN == 'sdpa':
+        k, v = kv_feats.unbind(dim=1)
+        out = _grouped_sdpa(q_feats, k, v, q_seq_lens, kv_seq_lens)
     elif config.ATTN == 'flash_attn':
         if 'flash_attn' not in globals():
             import flash_attn

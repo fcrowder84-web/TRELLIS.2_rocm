@@ -9,6 +9,24 @@ __all__ = [
 ]
 
 
+def _grouped_sdpa(q, k, v, q_seqlen, kv_seqlen):
+    """Apply inference-only SDPA independently to each variable-length group."""
+    from torch.nn.functional import scaled_dot_product_attention
+
+    outputs = []
+    q_start = kv_start = 0
+    for q_len, kv_len in zip(q_seqlen, kv_seqlen):
+        q_group = q[q_start:q_start + q_len].transpose(0, 1).unsqueeze(0)
+        k_group = k[kv_start:kv_start + kv_len].transpose(0, 1).unsqueeze(0)
+        v_group = v[kv_start:kv_start + kv_len].transpose(0, 1).unsqueeze(0)
+        out = scaled_dot_product_attention(
+            q_group, k_group, v_group, dropout_p=0.0, is_causal=False
+        )
+        outputs.append(out.squeeze(0).transpose(0, 1))
+        q_start += q_len
+        kv_start += kv_len
+    return torch.cat(outputs, dim=0)
+
 @overload
 def sparse_scaled_dot_product_attention(qkv: VarLenTensor) -> VarLenTensor:
     """
@@ -181,6 +199,12 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
         v = v.unsqueeze(0)
         mask = xops.fmha.BlockDiagonalMask.from_seqlens(q_seqlen, kv_seqlen)
         out = xops.memory_efficient_attention(q, k, v, mask)[0]
+    elif config.ATTN == 'sdpa':
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)
+        out = _grouped_sdpa(q, k, v, q_seqlen, kv_seqlen)
     elif config.ATTN == 'flash_attn':
         if 'flash_attn' not in globals():
             import flash_attn
